@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nsqd-prometheus-exporter
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: nsqd-prometheus-exporter
+  template:
+    metadata:
+      labels:
+        app: nsqd-prometheus-exporter
+    spec:
+      containers:
+        - args:
+            - -n
+            - "http://nsqd-0.apiservice:4151"
+            - -n
+            - "http://nsqd-0.apiservice:4151"
+            - -n
+            - "http://nsqd-0.apiservice:4151"
+          image: jinmz/nsqd-prometheus-exporter:v0.1
+          imagePullPolicy: IfNotPresent
+          name: nsqd-prometheus-exporter
+          ports:
+            - containerPort: 2112
+              name: metrics
+              protocol: TCP
+
+          resources:
+            limits:
+              cpu: 200
+              memory: 128Mi
+            requests:
+              cpu: 100m
+              memory: 56Mi
+          livenessProbe:
+            failureThreshold: 3
+            tcpSocket:
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            successThreshold: 1
+            timeoutSeconds: 1
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nsqd-prometheus-exporter-svc
+spec:
+  ports:
+    - name: metrics
+      port: 2112
+      protocol: TCP
+      targetPort: metrics
+  type: ClusterIP
+  selector:
+    app: nsqd-prometheus-exporter

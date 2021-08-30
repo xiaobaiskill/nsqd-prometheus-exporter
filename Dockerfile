@@ -1,13 +1,14 @@
-FROM golang:1.9.1-alpine3.6
+FROM golang:1.16.7-alpine3.14 as builder
 
-ADD ./ /go/src/github.com/adamweiner/nsqd-prometheus-exporter
+LABEL stage=builder
+RUN go env -w GOPROXY="https://goproxy.cn,direct"
+WORKDIR /go/src/app
+ARG Version=""
+ADD . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o nsqd-prometheus-exporter  -a -installsuffix cgo -ldflags \
+    "-X 'main.Version=${Version}'" .
 
-RUN apk update && \
-    apk add -U build-base git && \
-    cd /go/src/github.com/adamweiner/nsqd-prometheus-exporter && \
-    GOPATH=/go make && \
-    apk del build-base git
-
-EXPOSE 30000
-
-ENTRYPOINT ["/go/src/github.com/adamweiner/nsqd-prometheus-exporter/nsqd-prometheus-exporter"]
+FROM alpine:3.14
+WORKDIR /
+COPY --from=builder /go/src/app/nsqd-prometheus-exporter .
+ENTRYPOINT ["/nsqd-prometheus-exporter"]

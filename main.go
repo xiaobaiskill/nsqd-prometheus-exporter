@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus" // Prometheus client library
-	logger "github.com/sirupsen/logrus"              // Logging library
-	"gopkg.in/urfave/cli.v1"                         // CLI helper
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	logger "github.com/sirupsen/logrus" // Logging library
+	"github.com/urfave/cli/v2"          // CLI helper
 )
 
 var (
@@ -17,7 +17,7 @@ var (
 	Version string
 
 	scrapeInterval  int
-	nsqdURL         string
+	nsqds           []string
 	knownTopics     []string
 	knownChannels   []string
 	buildInfoMetric *prometheus.GaugeVec
@@ -44,33 +44,33 @@ func main() {
 	app.Name = "nsqd-prometheus-exporter"
 	app.Usage = "Scrapes nsqd stats and serves them up as Prometheus metrics"
 	app.Flags = []cli.Flag{
-		cli.StringFlag{
-			Name:   "nsqdURL, n",
-			Value:  "http://localhost:4151",
-			Usage:  "URL of nsqd to export stats from",
-			EnvVar: "NSQD_URL",
+		&cli.StringSliceFlag{
+			Name:     "nsqd",
+			Aliases:  []string{"n"},
+			Usage:    "URL of nsqd to export stats from",
+			Required: true,
+			EnvVars:  []string{"NSQD_URL"},
 		},
-		cli.StringFlag{
-			Name:   "listenPort, lp",
-			Value:  "30000",
-			Usage:  "Port on which prometheus will expose metrics",
-			EnvVar: "LISTEN_PORT",
+		&cli.StringFlag{
+			Name:    "listenPort",
+			Aliases: []string{"p"},
+			Value:   ":2112",
+			Usage:   "Port on which prometheus will expose metrics",
+			EnvVars: []string{"LISTEN_PORT"},
 		},
-		cli.StringFlag{
-			Name:   "scrapeInterval, s",
-			Value:  "30",
-			Usage:  "How often (in seconds) nsqd stats should be scraped",
-			EnvVar: "SCRAPE_INTERVAL",
+		&cli.IntFlag{
+			Name:    "scrapeInterval",
+			Value:   30,
+			Aliases: []string{"s"},
+			Usage:   "How often (in seconds) nsqd stats should be scraped",
+			EnvVars: []string{"SCRAPE_INTERVAL"},
 		},
 	}
-	app.Action = func(c *cli.Context) {
+	app.Action = func(c *cli.Context) error {
 		// Set and validate configuration
-		nsqdURL = c.GlobalString("nsqdURL")
-		if nsqdURL == "" {
-			logger.Warn("Invalid nsqd URL set, continuing with default (http://localhost:4151)")
-			nsqdURL = "http://localhost:4151"
-		}
-		scrapeInterval = c.GlobalInt("scrapeInterval")
+		nsqds = c.StringSlice("nsqd")
+
+		scrapeInterval = c.Int("scrapeInterval")
 		if scrapeInterval < 1 {
 			logger.Warn("Invalid scrape interval set, continuing with default (30s)")
 			scrapeInterval = 30
@@ -78,14 +78,14 @@ func main() {
 
 		// Initialize Prometheus metrics
 		var emptyMap map[string]string
-		commonLabels := []string{"type", "topic", "paused", "channel"}
+		commonLabels := []string{"url", "type", "topic", "paused", "channel"}
 		buildInfoMetric = createGaugeVector("nsqd_prometheus_exporter_build_info", "", "",
 			"nsqd-prometheus-exporter build info", emptyMap, []string{"version"})
 		buildInfoMetric.WithLabelValues(app.Version).Set(1)
 		// # HELP nsqd_info nsqd info
 		// # TYPE nsqd_info gauge
 		nsqMetrics[InfoMetric] = createGaugeVector(InfoMetric, PrometheusNamespace,
-			"", "nsqd info", emptyMap, []string{"health", "start_time", "version"})
+			"", "nsqd info", emptyMap, []string{"url", "health", "start_time", "version"})
 		// # HELP nsqd_depth Queue depth
 		// # TYPE nsqd_depth gauge
 		nsqMetrics[DepthMetric] = createGaugeVector(DepthMetric, PrometheusNamespace,
@@ -121,104 +121,120 @@ func main() {
 		// # HELP nsqd_channel_count Number of channels
 		// # TYPE nsqd_channel_count gauge
 		nsqMetrics[ChannelCountMetric] = createGaugeVector(ChannelCountMetric, PrometheusNamespace,
-			"", "Number of channels", emptyMap, commonLabels[:3])
+			"", "Number of channels", emptyMap, commonLabels[:4])
 
 		go fetchAndSetStats()
 
+		logger.Info("service up")
 		// Start HTTP server
-		http.Handle("/metrics", prometheus.Handler())
-		err := http.ListenAndServe(":"+strconv.Itoa(c.GlobalInt("listenPort")), nil)
+		http.Handle("/metrics", promhttp.Handler())
+		err := http.ListenAndServe(c.String("listenPort"), nil)
 		if err != nil {
 			logger.Fatal("Error starting Prometheus metrics server: " + err.Error())
 		}
+		return nil
 	}
 
-	app.Run(os.Args)
+	err := app.Run(os.Args)
+	if err != nil {
+		logger.Info(err.Error())
+	}
+}
+
+type know struct {
+	topics   []string
+	channels []string
 }
 
 // fetchAndSetStats scrapes stats from nsqd and updates all the Prometheus metrics
 // above on the provided interval. If a dead topic or channel is detected, the
 // application exits.
 func fetchAndSetStats() {
+	knowMap := make(map[string]*know, len(nsqds))
+	for _, v := range nsqds {
+		knowMap[v] = &know{}
+	}
 	for {
-		// Fetch stats
-		stats, err := getNsqdStats(nsqdURL)
-		if err != nil {
-			logger.Fatal("Error scraping stats from nsqd: " + err.Error())
-		}
-
-		// Build list of detected topics and channels - the list of channels is built
-		// including the topic name that each belongs to, as it is possible to have
-		// multiple channels with the same name on different topics.
-		var detectedChannels []string
-		var detectedTopics []string
-		for _, topic := range stats.Topics {
-			detectedTopics = append(detectedTopics, topic.Name)
-			for _, channel := range topic.Channels {
-				detectedChannels = append(detectedChannels, topic.Name+channel.Name)
+		for _, v := range nsqds {
+			nsqd := v
+			// Fetch stats
+			stats, err := getNsqdStats(nsqd)
+			if err != nil {
+				logger.Error("Error scraping stats from nsqd: " + err.Error())
+				continue
 			}
-		}
 
-		// Exit if a dead topic or channel is detected
-		if deadTopicOrChannelExists(knownTopics, detectedTopics) {
-			logger.Warning("At least one old topic no longer included in nsqd stats - rebuilding metrics")
-			for _, metric := range nsqMetrics {
-				metric.Reset()
+			// Build list of detected topics and channels - the list of channels is built
+			// including the topic name that each belongs to, as it is possible to have
+			// multiple channels with the same name on different topics.
+			var detectedChannels []string
+			var detectedTopics []string
+			for _, topic := range stats.Topics {
+				detectedTopics = append(detectedTopics, topic.Name)
+				for _, channel := range topic.Channels {
+					detectedChannels = append(detectedChannels, topic.Name+channel.Name)
+				}
 			}
-		}
-		if deadTopicOrChannelExists(knownChannels, detectedChannels) {
-			logger.Warning("At least one old channel no longer included in nsqd stats - rebuilding metrics")
-			for _, metric := range nsqMetrics {
-				metric.Reset()
+
+			// Exit if a dead topic or channel is detected
+			if deadTopicOrChannelExists(knowMap[nsqd].topics, detectedTopics) {
+				logger.Warning("At least one old topic no longer included in nsqd stats - rebuilding metrics")
+				for _, metric := range nsqMetrics {
+					metric.Reset()
+				}
 			}
-		}
-
-		// Update list of known topics and channels
-		knownTopics = detectedTopics
-		knownChannels = detectedChannels
-
-		// Update info metric with health, start time, and nsqd version
-		nsqMetrics[InfoMetric].
-			WithLabelValues(stats.Health, fmt.Sprintf("%d", stats.StartTime), stats.Version).Set(1)
-
-		// Loop through topics and set metrics
-		for _, topic := range stats.Topics {
-			paused := "false"
-			if topic.Paused {
-				paused = "true"
+			if deadTopicOrChannelExists(knowMap[nsqd].channels, detectedChannels) {
+				logger.Warning("At least one old channel no longer included in nsqd stats - rebuilding metrics")
+				for _, metric := range nsqMetrics {
+					metric.Reset()
+				}
 			}
-			nsqMetrics[DepthMetric].WithLabelValues("topic", topic.Name, paused, "").
-				Set(float64(topic.Depth))
-			nsqMetrics[BackendDepthMetric].WithLabelValues("topic", topic.Name, paused, "").
-				Set(float64(topic.BackendDepth))
-			nsqMetrics[ChannelCountMetric].WithLabelValues("topic", topic.Name, paused).
-				Set(float64(len(topic.Channels)))
+			// Update list of known topics and channels
+			knowMap[nsqd].topics = detectedTopics
+			knowMap[nsqd].channels = detectedChannels
 
-			// Loop through a topic's channels and set metrics
-			for _, channel := range topic.Channels {
-				paused = "false"
-				if channel.Paused {
+			// Update info metric with health, start time, and nsqd version
+			nsqMetrics[InfoMetric].
+				WithLabelValues(nsqd, stats.Health, fmt.Sprintf("%d", stats.StartTime), stats.Version).Set(1)
+
+			// Loop through topics and set metrics
+			for _, topic := range stats.Topics {
+				paused := "false"
+				if topic.Paused {
 					paused = "true"
 				}
-				nsqMetrics[DepthMetric].WithLabelValues("channel", topic.Name, paused, channel.Name).
-					Set(float64(channel.Depth))
-				nsqMetrics[BackendDepthMetric].WithLabelValues("channel", topic.Name, paused, channel.Name).
-					Set(float64(channel.BackendDepth))
-				nsqMetrics[InFlightMetric].WithLabelValues("channel", topic.Name, paused, channel.Name).
-					Set(float64(channel.InFlightCount))
-				nsqMetrics[TimeoutCountMetric].WithLabelValues("channel", topic.Name, paused, channel.Name).
-					Set(float64(channel.TimeoutCount))
-				nsqMetrics[RequeueCountMetric].WithLabelValues("channel", topic.Name, paused, channel.Name).
-					Set(float64(channel.RequeueCount))
-				nsqMetrics[DeferredCountMetric].WithLabelValues("channel", topic.Name, paused, channel.Name).
-					Set(float64(channel.DeferredCount))
-				nsqMetrics[MessageCountMetric].WithLabelValues("channel", topic.Name, paused, channel.Name).
-					Set(float64(channel.MessageCount))
-				nsqMetrics[ClientCountMetric].WithLabelValues("channel", topic.Name, paused, channel.Name).
-					Set(float64(len(channel.Clients)))
+				nsqMetrics[DepthMetric].WithLabelValues(nsqd, "topic", topic.Name, paused, "").
+					Set(float64(topic.Depth))
+				nsqMetrics[BackendDepthMetric].WithLabelValues(nsqd, "topic", topic.Name, paused, "").
+					Set(float64(topic.BackendDepth))
+				nsqMetrics[ChannelCountMetric].WithLabelValues(nsqd, "topic", topic.Name, paused).
+					Set(float64(len(topic.Channels)))
+
+				// Loop through a topic's channels and set metrics
+				for _, channel := range topic.Channels {
+					paused = "false"
+					if channel.Paused {
+						paused = "true"
+					}
+					nsqMetrics[DepthMetric].WithLabelValues(nsqd, "channel", topic.Name, paused, channel.Name).
+						Set(float64(channel.Depth))
+					nsqMetrics[BackendDepthMetric].WithLabelValues(nsqd, "channel", topic.Name, paused, channel.Name).
+						Set(float64(channel.BackendDepth))
+					nsqMetrics[InFlightMetric].WithLabelValues(nsqd, "channel", topic.Name, paused, channel.Name).
+						Set(float64(channel.InFlightCount))
+					nsqMetrics[TimeoutCountMetric].WithLabelValues(nsqd, "channel", topic.Name, paused, channel.Name).
+						Set(float64(channel.TimeoutCount))
+					nsqMetrics[RequeueCountMetric].WithLabelValues(nsqd, "channel", topic.Name, paused, channel.Name).
+						Set(float64(channel.RequeueCount))
+					nsqMetrics[DeferredCountMetric].WithLabelValues(nsqd, "channel", topic.Name, paused, channel.Name).
+						Set(float64(channel.DeferredCount))
+					nsqMetrics[MessageCountMetric].WithLabelValues(nsqd, "channel", topic.Name, paused, channel.Name).
+						Set(float64(channel.MessageCount))
+					nsqMetrics[ClientCountMetric].WithLabelValues(nsqd, "channel", topic.Name, paused, channel.Name).
+						Set(float64(len(channel.Clients)))
+				}
 			}
 		}
-
 		// Scrape every scrapeInterval
 		time.Sleep(time.Duration(scrapeInterval) * time.Second)
 	}
@@ -253,7 +269,7 @@ func createGaugeVector(name string, namespace string, subsystem string, help str
 		Help:        help,
 		Namespace:   namespace,
 		Subsystem:   subsystem,
-		ConstLabels: prometheus.Labels(labels),
+		ConstLabels: labels,
 	}, labelNames)
 	if err := prometheus.Register(gaugeVec); err != nil {
 		logger.Fatal("Failed to register prometheus metric: " + err.Error())
