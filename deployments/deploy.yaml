@@ -18,9 +18,11 @@ spec:
             - -n
             - "http://nsqd-0.apiservice:4151"
             - -n
-            - "http://nsqd-0.apiservice:4151"
+            - "http://nsqd-1.apiservice:4151"
             - -n
-            - "http://nsqd-0.apiservice:4151"
+            - "http://nsqd-2.apiservice:4151"
+            - -n 
+            - "15"
           image: jinmz/nsqd-prometheus-exporter:v0.1
           imagePullPolicy: IfNotPresent
           name: nsqd-prometheus-exporter
@@ -49,6 +51,8 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
+  labels:
+    service: nsqd-prometheus-exporter-svc
   name: nsqd-prometheus-exporter-svc
 spec:
   ports:
